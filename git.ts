@@ -410,20 +410,22 @@ function inflateEntry(buf: Buffer, pos: number, expectedSize: number): { data: B
       return null;
     }
   };
+  // Bracket: `fail` is a length known too short, `hi` a length known to inflate whole.
+  let fail = 0;
   let hi = Math.min(remaining, 64);
   let data = tryInflate(hi);
   while (data === null && hi < remaining) {
+    fail = hi;
     hi = Math.min(remaining, hi * 2);
     data = tryInflate(hi);
   }
   if (data === null) throw new Error('pack entry does not inflate');
-  let lo = Math.max(1, Math.floor(hi / 2));
-  while (lo < hi) {
-    const mid = Math.floor((lo + hi) / 2);
+  while (fail + 1 < hi) {
+    const mid = Math.floor((fail + hi) / 2);
     if (tryInflate(mid) !== null) hi = mid;
-    else lo = mid + 1;
+    else fail = mid;
   }
-  return { data, used: lo };
+  return { data, used: hi };
 }
 
 /** Apply a git delta buffer to a base object's data. */
@@ -777,10 +779,26 @@ function collectFetchObjects(
   req: FetchRequest,
 ): { objects: string[]; shallow: string[]; unshallow: string[] } {
   const haveCommits = req.haves.filter((h) => getCommit(repo, h) !== null);
+  // What the client provably has: the haves and their ancestry, but ancestry stops at the reported
+  // shallow boundaries — a shallow commit is on the client, its parents are not implied by any have.
+  const shallowSet = new Set(req.shallowIn.map((s) => peelToCommit(repo, s) ?? s));
   const haveClosure = new Set<string>();
-  for (const have of haveCommits) for (const c of walkCommits(repo, have)) haveClosure.add(c);
+  {
+    const stack = [...haveCommits];
+    while (stack.length > 0) {
+      const sha = stack.pop()!;
+      if (haveClosure.has(sha)) continue;
+      const commit = getCommit(repo, sha);
+      if (commit === null) continue;
+      haveClosure.add(sha);
+      if (shallowSet.has(sha)) continue; // do not descend past a shallow boundary
+      for (const parent of commit.parents) stack.push(parent);
+    }
+  }
 
-  // Distance (in generations, want = 1) from the wants, never crossing into have-closure commits.
+  // Distance (in generations, want = 1) from the wants, measured through everything — haves
+  // included, since a deepen's new limit is counted from a boundary that sits below a have.
+  // Exclusion of what the client already has happens at object selection, not here.
   const dist = new Map<string, number>();
   const queue: Array<[string, number]> = [];
   for (const want of req.wants) {
@@ -789,7 +807,7 @@ function collectFetchObjects(
   }
   while (queue.length > 0) {
     const [sha, d] = queue.shift()!;
-    if (dist.has(sha) || haveClosure.has(sha)) continue;
+    if (dist.has(sha)) continue;
     const commit = getCommit(repo, sha);
     if (commit === null) continue;
     dist.set(sha, d);
@@ -815,21 +833,20 @@ function collectFetchObjects(
 
   const shallow: string[] = [];
   const unshallow: string[] = [];
-  const shallowInSet = new Set(req.shallowIn.map((s) => peelToCommit(repo, s) ?? s));
   for (const sha of included) {
     const commit = getCommit(repo, sha);
     if (commit === null) continue;
-    const missingParent = commit.parents.some((p) => !included.has(p) && !haveClosure.has(p));
+    const missingParent = commit.parents.some((p) => !included.has(p) && !haveClosure.has(p) && !shallowSet.has(p));
     if (missingParent && commit.parents.length > 0) shallow.push(sha);
-    if (shallowInSet.has(sha) && !missingParent) unshallow.push(sha);
+    if (shallowSet.has(sha) && !missingParent) unshallow.push(sha);
   }
   // Former boundary commits that stayed included but whose parents are now in are unshallowed above;
   // boundary commits no longer wanted at all need no line.
 
   // Object closure of a commit set: the commits themselves plus every tree and blob they reach.
-  // `only` restricts which commits are walked (the depth-limited included set); trees and blobs of
-  // walked commits always come along.
-  const collectClosure = (tips: Set<string>, only: Set<string> | null, into: Set<string>): void => {
+  // `only` restricts which commits are walked (the depth-limited included set); `stopAt` commits are
+  // collected but their parents are not walked (shallow boundaries, for the have side).
+  const collectClosure = (tips: Set<string>, only: Set<string> | null, into: Set<string>, stopAt?: Set<string>): void => {
     const stack: string[] = [...tips];
     const seenCommits = new Set<string>();
     while (stack.length > 0) {
@@ -852,11 +869,12 @@ function collectFetchObjects(
           else into.add(entry.sha);
         }
       }
+      if (stopAt !== undefined && stopAt.has(commitSha)) continue;
       for (const parent of commit.parents) stack.push(parent);
     }
   };
   const haveObjects = new Set<string>();
-  collectClosure(haveClosure, null, haveObjects);
+  collectClosure(haveClosure, null, haveObjects, shallowSet);
   const wantedObjects = new Set<string>();
   collectClosure(included, included, wantedObjects);
   const objects: string[] = [];
@@ -905,7 +923,7 @@ export function handleUploadPack(repo: Repo, body: Buffer, protocolV2: boolean):
 function uploadPackV2(repo: Repo, body: Buffer): GitHttpResult {
   const { sections } = parsePktSections(body);
   const first = sections[0] ?? [];
-  const command = first.find((l) => l.startsWith('command='));
+  const command = first.find((l) => l.startsWith('command='))?.replace(/\n$/, '');
   if (command === 'command=ls-refs') {
     const args = sections[1] ?? [];
     return { status: 200, contentType: 'application/x-git-upload-pack-result', body: handleLsRefs(repo, args.map((l) => l.replace(/\n$/, ''))) };
@@ -920,7 +938,8 @@ function uploadPackV2(repo: Repo, body: Buffer): GitHttpResult {
       return { status: 200, contentType: 'application/x-git-upload-pack-result', body: pktLine(`ERR upload-pack: not our ref ${want}\n`) };
     }
   }
-  const chunks: Buffer[] = [];
+  // Sections are separated by delim pkt-lines; one flush ends the response.
+  const outSections: Buffer[][] = [];
   if (req.haves.length > 0) {
     const ackLines: string[] = ['acknowledgments\n'];
     const common = req.haves.filter((h) => repo.objects.has(h));
@@ -930,27 +949,32 @@ function uploadPackV2(repo: Repo, body: Buffer): GitHttpResult {
       for (const have of common) ackLines.push(`ACK ${have}\n`);
       ackLines.push('ready\n');
     }
-    for (const line of ackLines) chunks.push(pktLine(line));
-    chunks.push(PKT_FLUSH);
+    outSections.push(ackLines.map((line) => pktLine(line)));
   }
   if (req.waitForDone && !req.done) {
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(chunks) };
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: joinSections(outSections) };
   }
   const { objects, shallow, unshallow } = collectFetchObjects(repo, req);
   if (req.deepen !== null || req.shallowIn.length > 0) {
     const lines: string[] = ['shallow-info\n'];
     for (const sha of shallow) lines.push(`shallow ${sha}\n`);
     for (const sha of unshallow) lines.push(`unshallow ${sha}\n`);
-    if (lines.length > 1) {
-      for (const line of lines) chunks.push(pktLine(line));
-      chunks.push(PKT_FLUSH);
-    }
+    if (lines.length > 1) outSections.push(lines.map((line) => pktLine(line)));
   }
-  chunks.push(pktLine('packfile\n'));
   const pack = createPack(repo, objects);
-  chunks.push(sidebandWrap(pack, 1));
+  outSections.push([pktLine('packfile\n'), sidebandWrap(pack, 1)]);
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: joinSections(outSections) };
+}
+
+/** Join v2 response sections with delim pkt-lines and a final flush. */
+function joinSections(sections: Buffer[][]): Buffer {
+  const chunks: Buffer[] = [];
+  sections.forEach((section, index) => {
+    if (index > 0) chunks.push(PKT_DELIM);
+    chunks.push(...section);
+  });
   chunks.push(PKT_FLUSH);
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(chunks) };
+  return Buffer.concat(chunks);
 }
 
 function uploadPackV0(repo: Repo, body: Buffer): GitHttpResult {

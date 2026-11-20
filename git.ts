@@ -397,10 +397,10 @@ export function createPack(repo: Repo, shas: string[]): Buffer {
 }
 
 /** Inflate one zlib stream starting at `pos`, knowing its inflated size; returns data + bytes used. */
-function inflateEntry(buf: Buffer, pos: number, expectedSize: number): { data: Buffer; used: number } {
+function inflateEntry(buf: Buffer, pos: number, expectedSize: number, hint = 64): { data: Buffer; used: number } {
   // inflateSync tolerates trailing bytes, and any prefix at least as long as the stream inflates to the
   // same bytes — so the consumed length is the smallest prefix that inflates to the expected size.
-  // Bracket it by doubling, then binary-search inside the bracket.
+  // Bracket it by doubling from a hint (the previous entry's size), then binary-search the bracket.
   const remaining = buf.length - pos;
   const tryInflate = (len: number): Buffer | null => {
     try {
@@ -412,7 +412,7 @@ function inflateEntry(buf: Buffer, pos: number, expectedSize: number): { data: B
   };
   // Bracket: `fail` is a length known too short, `hi` a length known to inflate whole.
   let fail = 0;
-  let hi = Math.min(remaining, 64);
+  let hi = Math.min(remaining, Math.max(16, hint));
   let data = tryInflate(hi);
   while (data === null && hi < remaining) {
     fail = hi;
@@ -501,6 +501,7 @@ export function parsePack(repo: Repo, pack: Buffer): PackEntry[] {
   }
   const raws: Raw[] = [];
   const byOffset = new Map<number, number>();
+  let sizeHint = 64;
   for (let i = 0; i < count; i += 1) {
     const entryOffset = pos;
     let byte = pack[pos]!;
@@ -535,7 +536,8 @@ export function parsePack(repo: Repo, pack: Buffer): PackEntry[] {
       if (type === undefined) throw new Error(`unknown pack type ${typeCode}`);
       raw = { kind: 'full', type, offset: entryOffset };
     }
-    const { data, used } = inflateEntry(pack, pos, size);
+    const { data, used } = inflateEntry(pack, pos, size, sizeHint);
+    sizeHint = used;
     pos += used;
     raw.data = data;
     byOffset.set(entryOffset, raws.length);
@@ -739,7 +741,7 @@ function handleLsRefs(repo: Repo, args: string[]): Buffer {
   const target = headTarget(repo);
   const headSha = repo.refs.get(target);
   if (headSha !== undefined) {
-    if (matches('HEAD') || matches(target)) {
+    if (matches('HEAD')) {
       let line = `${headSha} HEAD`;
       if (wantSymrefs) line += ` symref-target:${target}`;
       chunks.push(pktLine(`${line}\n`));
@@ -769,6 +771,7 @@ interface FetchRequest {
   haves: string[];
   shallowIn: string[];
   deepen: number | null;
+  deepenRelative: boolean;
   done: boolean;
   waitForDone: boolean;
   sideBand: boolean;
@@ -799,6 +802,8 @@ function collectFetchObjects(
   // Distance (in generations, want = 1) from the wants, measured through everything — haves
   // included, since a deepen's new limit is counted from a boundary that sits below a have.
   // Exclusion of what the client already has happens at object selection, not here.
+  // For an absolute depth the BFS prunes at the limit: a depth-1 clone never walks the history.
+  const pruneAt = req.deepen !== null && !req.deepenRelative ? req.deepen : Infinity;
   const dist = new Map<string, number>();
   const queue: Array<[string, number]> = [];
   for (const want of req.wants) {
@@ -811,20 +816,23 @@ function collectFetchObjects(
     const commit = getCommit(repo, sha);
     if (commit === null) continue;
     dist.set(sha, d);
+    if (d >= pruneAt) continue;
     for (const parent of commit.parents) queue.push([parent, d + 1]);
   }
 
+  // Plain `deepen N` is an absolute depth counted from the wants. Only `deepen-relative`
+  // extends the client's existing shallow boundary (by N generations past it).
   let limit = Infinity;
   if (req.deepen !== null) {
-    if (req.shallowIn.length === 0) {
-      limit = req.deepen;
-    } else {
+    if (req.deepenRelative && req.shallowIn.length > 0) {
       let base = 0;
       for (const s of req.shallowIn) {
         const commitSha = peelToCommit(repo, s);
         if (commitSha !== null && dist.has(commitSha)) base = Math.max(base, dist.get(commitSha)!);
       }
       limit = base > 0 ? base + req.deepen : req.deepen;
+    } else {
+      limit = req.deepen;
     }
   }
 
@@ -898,13 +906,14 @@ function collectFetchObjects(
 }
 
 function parseFetchArgs(lines: string[]): FetchRequest {
-  const req: FetchRequest = { wants: [], haves: [], shallowIn: [], deepen: null, done: false, waitForDone: false, sideBand: true };
+  const req: FetchRequest = { wants: [], haves: [], shallowIn: [], deepen: null, deepenRelative: false, done: false, waitForDone: false, sideBand: true };
   for (const rawLine of lines) {
     const line = rawLine.replace(/\n$/, '');
     if (line.startsWith('want ')) req.wants.push(line.slice(5, 45));
     else if (line.startsWith('have ')) req.haves.push(line.slice(5, 45));
     else if (line.startsWith('shallow ')) req.shallowIn.push(line.slice(8, 48));
     else if (line.startsWith('deepen ')) req.deepen = Number.parseInt(line.slice(7), 10) || null;
+    else if (line === 'deepen-relative') req.deepenRelative = true;
     else if (line === 'done') req.done = true;
     else if (line === 'wait-for-done') req.waitForDone = true;
   }
@@ -980,7 +989,7 @@ function joinSections(sections: Buffer[][]): Buffer {
 function uploadPackV0(repo: Repo, body: Buffer): GitHttpResult {
   const { sections } = parsePktSections(body);
   const lines = sections.flat();
-  const req: FetchRequest = { wants: [], haves: [], shallowIn: [], deepen: null, done: false, waitForDone: false, sideBand: false };
+  const req: FetchRequest = { wants: [], haves: [], shallowIn: [], deepen: null, deepenRelative: false, done: false, waitForDone: false, sideBand: false };
   for (const rawLine of lines) {
     const line = rawLine.replace(/\n$/, '');
     if (line.startsWith('want ')) {
@@ -990,6 +999,7 @@ function uploadPackV0(repo: Repo, body: Buffer): GitHttpResult {
     } else if (line.startsWith('have ')) req.haves.push(line.slice(5, 45));
     else if (line.startsWith('shallow ')) req.shallowIn.push(line.slice(8, 48));
     else if (line.startsWith('deepen ')) req.deepen = Number.parseInt(line.slice(7), 10) || null;
+    else if (line === 'deepen-relative') req.deepenRelative = true;
     else if (line === 'done') req.done = true;
   }
   for (const want of req.wants) {
